@@ -1,0 +1,414 @@
+---
+title: "RSQLite_ex Kai Saito"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+#importing required libraries
+library(RSQLite)
+
+```
+
+## Problem 1
+
+## Problem 1.1
+
+```{r}
+# sqlite3 customers.db
+# sqlite> .mode csv
+# sqlite> .import /Users/sow/Downloads/orders.csv orders
+# sqlite> .schema orders
+# CREATE TABLE IF NOT EXISTS "orders"(
+#   "OrderID" TEXT,
+#   "CustomerID" TEXT,
+#   "SKU" TEXT,
+#   "Description" TEXT,
+#   "Cost" TEXT,
+#   "Year_Purchase" TEXT
+# );
+# sqlite> .import /Users/sow/Downloads/customers.csv customers
+# sqlite> .schema customers
+# CREATE TABLE IF NOT EXISTS "customers"(
+#   "CustomerID" TEXT,
+#   "FirstName" TEXT,
+#   "LastName" TEXT,
+#   "StreetAddress" TEXT,
+#   "City" TEXT,
+#   "State" TEXT,
+#   "ZipeCode" TEXT,
+#   "Telephone" TEXT,
+#   "Purchases_Total" TEXT
+# );
+# sqlite> .import /Users/sow/Downloads/Router_Info.csv Router_Info
+# sqlite> .schema Router_Info
+# CREATE TABLE IF NOT EXISTS "Router_Info"(
+#   "RMAID" TEXT,
+#   "OrderID" TEXT,
+#   "Status" TEXT,
+#   "Step" TEXT,
+#   "Reason" TEXT,
+#   "CustomerID" TEXT
+# );
+```
+
+```{r}
+# Create an ephemeral in-memory RSQLite database
+con <- dbConnect(RSQLite::SQLite(), "customers.db") 
+
+# check to confirm tables
+dbListTables(con)
+
+# queries to get the number of rows in movie_info and director_info tables 
+dbGetQuery(con, 'SELECT * FROM customers LIMIT 10;')
+dbGetQuery(con, 'SELECT * FROM orders LIMIT 10;')
+dbGetQuery(con, 'SELECT * FROM Router_Info LIMIT 10;')
+```
+
+## Problem 1.2
+```{r}
+# queries to describe the structure of the tables
+dbGetQuery(con,'PRAGMA table_xinfo(customers)')
+dbGetQuery(con,'PRAGMA table_xinfo(orders)')
+dbGetQuery(con,'PRAGMA table_xinfo(Router_Info)')
+```
+Customers table has details about the customers such as name,address,telephone. Orders give detail about the order like SKU,Description,Year_Purchase,Cost. Router_info has the information about the Router(step,reason). 
+OrderID and CustomerID are the primary keys. CustomerID is also the foreign key that connects all 3 tables.
+As you can see all of the datatypes are text.
+
+## Problem 1.3
+```{r}
+# select the orders where purchase year is 2019
+dbGetQuery(con, 'SELECT * FROM orders WHERE Year_Purchase=2019 LIMIT 10;')
+```
+
+## Problem 1.4
+```{r}
+# query to join the 3 tables
+dbGetQuery(con,'SELECT * FROM customers INNER JOIN orders ON customers.CustomerID = orders.CustomerID 
+           JOIN Router_info ON Router_info.CustomerID = orders.CustomerID LIMIT 10;')
+```
+
+
+## Problem 1.5
+
+```{r}
+# query to left join the tables customers on Router_Info 
+
+sqlcmd = "SELECT * FROM customers c
+LEFT JOIN Router_Info r ON r.customerid = c.customerid;"
+query = dbSendQuery(con, sqlcmd)
+rs <- dbFetch(query)
+print(head(rs))
+dbClearResult(query)
+```
+In this problem, I joined customer table on router_info table using customerid 
+
+
+## Problem 1.6 
+
+```{r}
+# Query to identify customers by state with cost of orders greater than 100 and order the result in descending order
+
+sqlcmd = "SELECT c.*, sum(o.cost) AS TotalCost FROM customers c
+JOIN Router_Info r ON r.customerid = c.customerid
+JOIN orders o ON o.customerid = c.customerid
+GROUP BY c.state
+HAVING sum(o.cost) > 100
+ORDER BY sum(o.cost) desc;"
+query = dbSendQuery(con, sqlcmd)
+rs <- dbFetch(query)
+print(head(rs))
+dbClearResult(query)
+
+```
+In this problem, I used orders table to find total cost and joined that with 
+customers table on customer id to find total cost incurred by each customer
+
+
+## Problem 1.7
+
+```{r}
+# query to find total number of cities available in customers table
+
+sqlcmd = "SELECT count(city) FROM customers;"
+query = dbSendQuery(con, sqlcmd)
+rs <- dbFetch(query)
+print(rs)
+dbClearResult(query)
+```
+In this problem, I used count to find total number of records which have city 
+field filled in
+
+```{r}
+# query to find number of unique cities recorded in customers table 
+
+sqlcmd = "SELECT count(DISTINCT city) FROM customers;"
+query = dbSendQuery(con, sqlcmd)
+rs <- dbFetch(query)
+print(rs)
+dbClearResult(query)
+
+```
+In this problem, I used distinct city to find number unique values under city
+
+
+## Problem 1.8
+
+```{r}
+# query to identify maximum, minimum and total cost of orders by year of purchase
+
+sqlcmd = "SELECT Year_Purchase, MIN(cost) AS MinimumCost, MAX(cost) AS MAximumCost, SUM(cost) AS TotalCost FROM orders
+GROUP BY YEAR_Purchase
+ORDER BY SUM(cost) desc;"
+query = dbSendQuery(con, sqlcmd)
+rs <- dbFetch(query)
+print(rs)
+dbClearResult(query)
+```
+In this problem, I used orders table to find maximum, minimum and total cost 
+incurred across years of purchase. Ordered it by total cost in descending order
+
+## Problem 1.9
+
+```{r}
+# create a query that uses Between, and, <, >
+use_between_and <- dbGetQuery(con, 'SELECT Purchases_Total, CustomerID FROM 
+customers WHERE CustomerID BETWEEN 1120 AND 1150 AND
+Purchases_Total > 1 AND Purchases_Total < 4;')
+
+# show results
+use_between_and
+
+```
+In this problem, I selected the total purchases and the customer ID for 
+instances where the customer ID was between 1120 and 1150, and also where
+the total purchase was greater than 1 but less than 4.
+
+## Problem 1.10
+
+```{r}
+# create a query that uses a wildcard, a join, and a group by clause
+
+# gets cost for each zip code starting with 97
+wild_join_group  <- dbGetQuery(con, 'SELECT o.Cost, c.ZipeCode 
+FROM orders o
+JOIN customers c
+ON c.CustomerId= o.CustomerId 
+GROUP BY c.ZipeCode 
+HAVING c.ZipeCode LIKE "97%";')
+
+wild_join_group
+```
+In this query I selected the cost from orders and the zipcode from customers,
+joined the two tables, grouped by the zip code since there were multiple instances
+of each zipcode, and then filtered for only times when the zipcode 
+started with 97.
+
+
+## Problem 1.11
+
+```{r}
+# create a query that finds the average and uses AND, OR, NOT 
+
+average_and_or_not <- dbGetQuery(con, 'SELECT AVG(Cost)
+FROM orders 
+WHERE Year_Purchase=2020 OR Year_Purchase=2021;')
+
+average_and_or_not
+```
+In this code I found the average of the cost in instances where the 
+year of purchase was 2020 or 2021.
+
+```{r}
+# disconnect from first database
+dbDisconnect(con)
+```
+
+## Problem 2
+
+```{r}
+# code to import csv files into sqlite
+# sqlite3 HIV.db
+# .mode csv
+# .import Downloads/HIV_info.csv HIV_info
+# .import Downloads/country_info.csv country_info
+# .tables
+# SELECT * FROM HIV_info
+# SELECT * FROM country_info
+```
+
+## Problem 2.1
+
+```{r}
+# connect to the database
+db2 <- dbConnect(RSQLite::SQLite(),"HIV.db")
+
+# list tables under database
+dbListTables(db2)
+
+
+sqlcmd = "PRAGMA table_xinfo(country_info);"
+query = dbSendQuery(db2, sqlcmd)
+rs <- dbFetch(query)
+print(head(rs))
+dbClearResult(query)
+
+sqlcmd = "PRAGMA table_xinfo(HIV_info);"
+query = dbSendQuery(db2, sqlcmd)
+rs <- dbFetch(query)
+print(head(rs))
+dbClearResult(query)
+
+
+sqlcmd = 'SELECT C.Country, C.Year, C.Country_Population, CAST(REPLACE(H.number_of_people_living_with_HIV, ",", "") AS DECIMAL) AS number_of_people_living_with_HIV
+
+FROM country_info C
+
+JOIN HIV_info H ON H.Entity = C.Country
+AND H.Year = C.Year;'
+query = dbSendQuery(db2, sqlcmd)
+rs <- dbFetch(query)
+print(head(rs))
+dbClearResult(query)
+
+
+sqlcmd = 'SELECT Entity, MAX(CAST(REPLACE(number_of_people_living_with_HIV, ",", "") AS DECIMAL)) AS Highest_HIV_population, MIN(CAST(REPLACE(number_of_people_living_with_HIV, ",", "") AS DECIMAL)) AS Lowest_HIV_population FROM HIV_info
+GROUP BY Entity;'
+query = dbSendQuery(db2, sqlcmd)
+rs <- dbFetch(query)
+print(head(rs))
+dbClearResult(query)
+```
+The country_info table has information regarding a country's population, GDP, unemployemnt rate, school enrollment rate by year from 2007 to 2017.
+
+The HIV_info table has information regarding number of people with HIV infection, total number of deaths, deaths by age, infection rate and new cases of infection reported by year from 2007 to 2017 and by country
+
+Both tables have year and country common, hence following information can be known:
+- percentage of HIV population from overall population can be known
+- HIV rate by year can be known
+- Country with highest and lowest HIV population can be known along with the country's economic conditions
+
+
+## Problem 2.2
+
+```{r}
+# query to identify new_cases_of_hiv_infection and school_enrollment_rate in each year for North America 
+
+sqlcmd = "SELECT C. country, C. year, C. School_enrollment_rate, H. new_cases_of_hiv_infection 
+FROM country_info C
+JOIN HIV_info H ON H.entity = C.country AND H.year = C.year
+WHERE C. Country = 'North America';"
+query = dbSendQuery(db2, sqlcmd)
+rs <- dbFetch(query)
+print(head(rs))
+dbClearResult(query)
+```
+In this problem, I joined country_info table on HIV_info table using country and year columns. In 2017, North America has observed highest number of cases with new HIV infections while the lowest in 2010. The school_enrollment rate was highest in 2008 while the lowest in 2011. The rate of school enrollment has fallen from 2007 to 2017 while the cases of new HIV infection increased
+
+
+## Problem 2.3
+
+```{r}
+# Select Country, Year, Country_Population, get  percent of  people living with HIV and percent of deaths from HIV 
+# join hiv_info to the country_info table on Entity/Country and year for only North America
+
+perc.HIV.liv.deaths.NorthAmerica <- dbGetQuery(db2, 'SELECT c.Country, c.Year, c.Country_Population,
+(100.0*CAST(REPLACE(h.number_of_people_living_with_HIV,",", "") AS DECIMAL)) / c.Country_Population AS "Percentage of People Living with HIV",
+(100.0*deaths_total/cast(replace(number_of_people_living_with_HIV,",", "") AS DECIMAL)) AS "Percentage of Deaths from HIV"
+FROM country_info c
+JOIN HIV_info h
+ON h.Entity = c.Country
+AND h.Year = c.Year
+WHERE c.Country="North America";')
+
+perc.HIV.liv.deaths.NorthAmerica
+
+# note: number of people living HIV value does not make sense, since it is larger than total population of the country
+
+```
+In this problem, I replaced the commans in the number_of_people_living_with_HIV with blanks and then cast it as a decimal so that I can divide it by the country population. The number of people living with HIV within a country is greater than the total country population; therefore, the percentages are greater than 100% for that section. For the percentage of deaths from HIV, I interpreted that to mean the total number of deaths from HIV divided by the number of people living with HIV. Normally, I would interpret this to mean the the total number of deaths due to HIV divided by the total number of deaths within a country in general, but I did not have this information. The two tables were joined on Country/Entity and Year, and filtered for only where the Country is North America. This was a little confusing because Canada and the United States are both located in North America. 
+
+## Problem 2.4
+
+```{r}
+# Select columns Country, get SUM of the
+#number_of_people_living_with_HIV divided by Country_Population then join
+#the data hiv_info, get not in North America
+
+sum.living.not.NorthAmerica <- dbGetQuery(db2,'SELECT c.Country, c.Year, (SELECT SUM(CAST(REPLACE(h.number_of_people_living_with_HIV,",", "") AS DECIMAL)) FROM HIV_info h)/c.Country_Population*1.0 AS sum_people_living_with_HIV_div_Country
+FROM country_info c
+JOIN HIV_info h
+ON h.Entity = c.Country
+AND h.Year = c.Year
+WHERE c.Country!="North America";')
+
+sum.living.not.NorthAmerica
+                     
+```
+In this query, I selected for the country and the year from country_info, and
+created a subquery in order to get the sum of the number of people living with HIV, 
+then divided that sum by each row in the country population. If I did the division 
+first, then summed, then there would only be one value and I would be unable to join, 
+which is why I interpreted the question to mean summing the number of people
+living with HIV first, then dividing. 
+
+
+## Problem 2.5
+
+-Select School_enrollment_rate, unemployment_rate with the data grouped by country for year 2012
+```{r}
+dbGetQuery(db2,'SELECT country, School_enrollment_rate, unemployment_rate
+           FROM country_info WHERE Year = 2012 GROUP BY country;')
+```
+
+We can see that Canada has the most School_enrollment_rate(99.45), and United States has most unemployment_rate(8.06) 
+for the year 2012.
+
+-Select year, average of GDP_per_capital grouped by year and ordered by descending order
+```{r}
+dbGetQuery(db2,'SELECT Year, AVG(CAST(GDP_per_capital AS DECIMAL)) AS avg_GDP_per_capital FROM country_info GROUP BY Year ORDER BY avg_GDP_per_capital DESC;')
+```
+
+2013 has the highest average of the GDP_per_capital.
+Cast() is used to change the datatype of the variable for calculation purposes and avg() for finding average.
+
+-Query to find the percentage of death<5 in Canada for all the years
+```{r}
+dbGetQuery(db2, 'SELECT c.Country, c.Year, c.Country_Population,h."deaths<5",
+(100.0*CAST(h."deaths<5" AS DECIMAL)) / h.deaths_total AS "Percentage of death<5"
+FROM country_info c
+JOIN HIV_info h
+ON h.Entity = c.Country
+AND h.Year = c.Year
+WHERE c.Country="Canada";')
+```
+
+As you can see the death<5 percentage is low for all of the years.
+Cast() is used to change the datatype of the variable for calculation purposes.
+
+-Query to find the total new_cases_of_hiv_infection grouped by year
+```{r}
+dbGetQuery(db2, 'SELECT c.Year,sum(h.new_cases_of_hiv_infection) as "Total_new_HIV_cases"
+FROM country_info c
+JOIN HIV_info h
+ON h.Entity = c.Country
+AND h.Year = c.Year
+GROUP BY h.year ORDER BY Total_new_HIV_cases DESC')
+```
+
+Total new HIV cases were the most in the recent year 2017.
+sum() function is used to find the total.
+
+-Query to find the minimum and maximum deaths_total in HIV_info
+```{r}
+dbGetQuery(db2, 'SELECT MAX(CAST(deaths_total AS INT)) AS max_deaths_total FROM HIV_info;')
+dbGetQuery(db2, 'SELECT MIN(CAST(deaths_total AS INT)) AS min_deaths_total FROM HIV_info;')
+```
+
+
+```{r}
+dbDisconnect(db2)
+```
+

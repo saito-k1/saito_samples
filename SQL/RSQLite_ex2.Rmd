@@ -1,0 +1,164 @@
+---
+title: "A6 Kai.Saito"
+output: pdf_document
+date: "2022-10-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message=FALSE, options(width=60))
+```
+
+```{r}
+# import necessary libraries
+library(RSQLite)
+library(ggplot2)
+library(glue)
+```
+
+## Bonus
+
+Both the certificates of completion for DataCamp: "Introduction to SQL" and "Intermediate SQL" are included in a separate pdf labeled Bonus. 
+
+## Problem 1 
+
+## Problem 1.1 
+```{r}
+# Code run in SQL console:
+# .help
+#. open Downloads/imdb.db
+# .tables
+# .mode column
+# select * from movie_info;
+
+# CREATE TABLE director_info(
+# Director_ID PRIMARY KEY,
+# Director_Name TEXT);
+```
+
+## Problem 1.2
+```{r}
+# .separator ","
+# --first line is column names, skipped
+# .import --csv --skip 1 Downloads/directors.csv director_info
+# --verify that it was imported correctly
+# .tables 
+# select * from director_info;
+```
+
+
+## Problem 2 
+
+## Problem 2.1
+```{r}
+# Part 1
+
+# connect to database
+db <- dbConnect(RSQLite::SQLite(), "imdb.db")
+
+# take a look at data
+dbGetQuery(db, 'SELECT * FROM movie_info LIMIT 5;')
+dbGetQuery(db, 'SELECT * FROM director_info LIMIT 5;')
+
+# issue queries
+
+# count number of rows in movie_info
+movie_info_count <- dbGetQuery(db, 'SELECT COUNT(*) FROM movie_info AS movie_info_count;')
+
+movie_info_count
+
+# count number of rows in director_info
+director_info_count <- dbGetQuery(db, 'SELECT COUNT(*) FROM director_info AS director_info_count;')
+
+director_info_count
+```
+
+## Problem 2.2
+```{r}
+# Part 2
+# number of between released between 2010 and 2020
+movies_btw_2010_2020 <- dbGetQuery(db, 'SELECT COUNT(*) FROM movie_info 
+                                   WHERE Release_Year BETWEEN 2010 AND 2020;')
+
+# visualization
+for_visualization_2010_2020 <- dbGetQuery(db, 'SELECT Release_Year FROM movie_info 
+                                          WHERE Release_Year BETWEEN 2010 and 2020;')
+
+ggplot(for_visualization_2010_2020, aes(x=Release_Year)) +
+  geom_bar(color="blue") +
+  ggtitle("Release Year vs Counts")
+```
+
+## Problem 2.3
+```{r}
+Action_IMDB_stats <- dbGetQuery(db, "SELECT MAX(IMDB_Rating) AS Action_Max,
+                                MIN(IMDB_Rating) AS Action_Min,
+                                AVG(IMDB_Rating) AS Action_Avg FROM
+                                movie_info WHERE Genre LIKE '%Action%';")
+
+Action_IMDB_stats
+
+```
+
+## Problem 2.4
+```{r}
+# 25 highest grossing movies 
+
+# must remove NAs, or else all highest are NAs
+highest_grossing <- dbGetQuery(db, "SELECT Series_Title, Genre, Gross 
+FROM movie_info WHERE Gross IS NOT \"NA\" 
+                               ORDER BY GROSS Desc Limit 25;")
+
+highest_grossing
+```
+
+
+## Problem 2.5
+
+```{r}
+# left join the two columns, join by primary key
+highest_directors <- dbGetQuery(db, 'SELECT director_info.Director_Name, movie_info.Gross 
+                                FROM movie_info LEFT JOIN director_info 
+                                ON director_info.Director_ID=movie_info.Director_ID 
+                                WHERE Gross IS NOT \"NA\" 
+                                ORDER BY Gross DESC LIMIT 25;')
+
+# show results
+highest_directors
+
+# create bar plot of results
+ggplot(highest_directors, aes(x=reorder(Director_Name, -Gross), y=Gross, fill=Director_Name)) +
+  geom_bar(stat="summary") + 
+  ggtitle("Top 25 Directors by Gross Revenue")  +
+  theme(axis.text.x=element_text(angle=45, hjust=1,size=6),legend.key.size=unit(0.1, "cm")) + 
+  labs(x="Director Name", y="Gross")
+```
+
+## Problem 2.6
+
+```{r}
+# create function that takes director name as arg, queries database to check if director exists
+
+verifyDirector <- function(x){
+  # first add director name to movie_info by joining, then query for name
+  q <- dbGetQuery(db, 'SELECT director_info.Director_Name FROM director_info 
+                  LEFT JOIN movie_info ON movie_info.Director_ID = director_info.Director_ID
+                  WHERE director_info.Director_Name = :x;', params=list(x=x))
+  # if else depending on if result was returned
+  if (nrow(q)==0) {glue("The director {x} was not found in the table.")}
+  else {glue("The director {x} was found in the table.")}
+}
+
+# check the function to make sure it worked
+verifyDirector("J.J. Abrams")
+verifyDirector("Adam Smith")
+
+# disconnect from database
+dbDisconnect(db)
+
+```
+ 
+
+
+
+  
+

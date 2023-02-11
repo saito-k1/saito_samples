@@ -1,0 +1,525 @@
+---
+title: "P3 Kai Saito"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r}
+# loading necessary libraries
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(tidyverse)
+library(scales)
+library(caret)
+library(corrplot)
+library(openintro)
+library(psych)
+library(DMwR)
+library(fastDummies)
+```
+
+# Question 1
+
+
+## Data Exploration
+```{r}
+# Loading data into dataframe (used smaller dataset provided)
+tripdata_df <- read.delim2 ("P3smaller.csv", header=TRUE, sep = ",", na.strings = c(""))
+
+# check the dimensions of the data
+dim(tripdata_df)
+
+# get overall structure and check type of features
+str(tripdata_df)
+
+# take a look at summary statistics of data
+summary(tripdata_df)
+
+# check for duplicated data
+sum(duplicated(tripdata_df))
+
+```
+
+### Check for missing values
+```{r}
+# some character NAs in data, change to regular NAs
+tripdata_df[tripdata_df == "NA"] <- NA
+
+# get number of nas in data
+sapply(tripdata_df, function(x) sum(is.na(x)))
+```
+
+### Some Data adjustments
+```{r}
+# some data adjustments: remove ehail_fee since most are NA, change data to proper types
+# PULocationID and RateCode ID were considered factors because they refer to specific zones 
+# and are not true numeric data
+# remove duplicated values
+tripData <- tripdata_df %>% 
+  select(-ehail_fee) %>% 
+  mutate(across(c(RatecodeID, VendorID, trip_type, payment_type, 
+                  passenger_count, tolls_amount, improvement_surcharge,
+                  store_and_fwd_flag, extra, mta_tax, improvement_surcharge,
+                  congestion_surcharge,PULocationID, DOLocationID), as.factor)) %>% 
+  mutate(across(c(trip_distance, fare_amount,
+                  total_amount, tip_amount), as.numeric)) %>% 
+  unique() %>% 
+  relocate(tip_amount, .after = last_col())
+
+# make sure they converted properly
+glimpse(tripData)
+
+# in order to run correlations, only pull out numeric: created new w/ all numeric
+# remove date for now, will feature engineer this value later to categorical
+corData <- tripData %>% 
+  select(trip_distance, fare_amount,
+                  total_amount, tip_amount) %>% 
+  mutate_all(as.numeric) %>% 
+  relocate(tip_amount, .after = last_col()) %>% 
+  na.omit() 
+```
+First, we removed ehail_fee here because the vast majority of the items are NAs and it does not provide any information for our model. We removed duplicated values and changed the features to the proper format. PULocationID and DOLocationID are most likely actually factor variables: the zones are specific and discrete. However, there are a lot of them, which may lead to increased dummy variables. For categorical variables, an ANOVA test will be performed later on to determine correlation.
+
+In order to get the correlations later on, we created a separate dataframe of all the numeric features. Additionally, the nas are omitted to make it easier to check the distribution for this part. The NAs in the original dataframe will be removed later on in problem 2. 
+
+### Distribution Analysis and Some Transformations
+```{r}
+# take a look at distribution of numerical data
+pairs.panels(corData, main = "Correlation matrix showing correlation between trip_distance, fare_amount, total_amount, tip_amount",cex.main=0.8)
+mtext(~italic("Pairs.panels showing distribution and correlations of features"),side=1,line=3, cex=0.5)
+
+# show some histograms
+ggplot(corData, aes(x = as.numeric(tip_amount))) +
+  geom_histogram (binwidth = 3, fill="blue") +
+  labs(x = "Tip amount in USD", y = "Count", caption = "Tip amount is the tip given and is applicable for credit card only. \nThe distribution is skewed towards right showing that majority of \nthe tips given were below 25 USD") +
+  ggtitle("Tip amount distribution by count") +
+  scale_y_log10() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(corData, aes(x = as.numeric(trip_distance))) +
+  geom_histogram(binwidth = 3, fill="green") +
+  labs(x = "Trip distance in miles", y = "Count", caption = "Trip distance shows distance in miles as calculated by the taximeter. \nThe distribution across the graph is skewed towards right indicating that \nmajority of the trips taken were falling under 25 mile radius from \nthe starting point") +
+  ggtitle("Trip distance distribution by count") +
+  scale_y_log10() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(corData, aes(x = as.numeric(fare_amount))) +
+  geom_histogram(binwidth = 3, fill="red") +
+  labs(x = "Fare amount", y = "Count", caption = "Fare amount is the fare calculated by the meter based on travel time and distance. \nAs indicated in the graph, majority of the trips taken were \nsubjected to total fare amount falling between 0 and 125 USD") +
+  ggtitle("Fare amount distribution by count") +
+  scale_y_log10() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+# log transform skewed features
+tripData_tx <- tripData %>% 
+   mutate(trip_distance=log(trip_distance+1),
+          fare_amount=log(fare_amount+1),
+          total_amount=log(total_amount+1)) 
+ 
+# check to make sure they transformed okay
+pairs.panels(tripData_tx[, c("trip_distance", "fare_amount", 
+                             "tip_amount", "total_amount")], main = "Correlation matrix showing correlation between trip_distance, fare_amount, total_amount, tip_amount after data transformation", cex.main=0.5)
+mtext(~italic("Pairs.panels showing transformation of skewed data"),side=1,line=3, cex=0.5)
+
+```
+There are various features that are skewed: trip_distance, fare_amount, and tip_amount,  and total_amount are right skewed. Trip_distance, fare_amount, and total_amount were log transformed +1 in order to normalize them. Sqrt transformation was attempted on the tip_amount, but did not adequately change the distribution. Regardless, we felt that it would be better not to transform the target, as the dependent variable does not necessarily have to be normally distributed. The distributions of the categorical features were not mentioned, as these were not transformed. 
+
+### Correlation Analysis
+```{r}
+# create correlation matrix for numeric data
+tripCor <- cor(x = corData, use="everything")
+
+# take a look 
+tripCor
+
+# create visualization
+corrplot(tripCor, method = "circle", tl.col = "blue", main = "Correlation matrix showing correlation between trip_distance, fare_amount, total_amount, tip_amount", cex.main=0.5, mar=c(0,0,1,0))
+mtext(~italic("Correlation visualization of continuous data"),side=1,line=3, cex=0.5)
+
+# for categorical data, use ANOVA 
+categorical_fea <- c("RatecodeID", "VendorID", "trip_type", "payment_type", 
+                  "passenger_count", "tolls_amount", "improvement_surcharge",
+                  "store_and_fwd_flag", "extra", "mta_tax", "PULocationID",
+                  "DOLocationID", "improvement_surcharge",
+                  "congestion_surcharge")
+
+catData <- tripData_tx %>% 
+  select(all_of(categorical_fea), tip_amount)
+
+# ANOVA for correlations between categorical and continuous data
+anova <- aov(tip_amount ~., data=catData)
+
+# check summary
+summary(anova)
+
+```
+As per the correlation matrix, tip_amount has a fairly good correlation with features like trip_distance, fare_amount, extra, total_amount, and payment_type hence I consider these to be good predictors of tip_amount compared to others which have very low correlation. Referring to data dictionary, tip_amount is calculated on credit payments only and hence payment_type is the first filter that can be applied to predict tip amount i.e., when a payment is made through credit, the probability of tip is more compared to other payment_type categories. As trip_distance increases, fare_amount and total_amount to be paid by the passenger increases and this coupled with credit payment can be considered as factors to predict tip_amount based on green taxi data.
+
+Fare_amount and total_amount are highly collinear with each other, and fare_amount will be removed in the feature selection area. 
+
+Since the cor function does not work between categorical and continuous variables I performed an ANOVA with just the categorical features to see if they were significantly correlated with the target. The improvement_surcharge, store_and_fwd_flag, and trip_type do not seem to be correlated at all. These will be removed in Problem 2. An alternative to this test would have been to dummy code first; however, I had a lot of dummy variables for the pickup and dropoff locations, which would make the results very cluttered. 
+
+Improvement_surcharge, store_and_fwd_flag, and trip_type were the least correlated features; however, passenger_count and mta_tax were also not significantly correlated. Although their p-values were greater than 0.05, we opted to keep these in here because their p-values were still on the lower side and their F values were higher than the other three. 
+
+### Outlier Detection
+```{r}
+# check for outliers
+
+# look at boxplot of numeric data
+boxplot(corData, boxcol = 2, boxfill = 4, main = "Boxplot of trip_distance, fare_amount, total_amount, tip_amount")
+mtext(~italic("The box plot visualizes the outliers observed for trip_distance, fare_amount, total_amount, and tip_amount. As observed, outliers exists for all four features"),side=1,line=3, cex=0.5)
+
+# take a look at plots for categorical data
+
+ggplot(catData, aes(x=catData$RatecodeID, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "RatecodeID", y = "Tip_amount", title = "Boxplot of tip_amount vs RatecodeID", caption = "Outliers observed for 1,4, and 5 type of RatecodeID") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$VendorID, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "VendorID", y = "Tip_amount", title = "Boxplot of tip_amount vs VendorID", caption = "Outliers observed for VendorID") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$trip_type, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "trip_type", y = "Tip_amount", title = "Boxplot of tip_amount vs trip_type", caption = "Outliers observed for 1 and 2 trip_type") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$payment_type, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "payment_type", y = "Tip_amount", title = "Boxplot of tip_amount vs payment_type", caption = "Outliers observed for 1 payment_type") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$passenger_count, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "passenger_count", y = "Tip_amount", title = "Boxplot of tip_amount vs passenger_count", caption = "Outliers observed for passenger_count") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$tolls_amount, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "tolls_amount", y = "Tip_amount", title = "Boxplot of tip_amount vs tolls_amount", caption = "Outliers observed for tolls_amount") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$improvement_surcharge, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "improvement_surcharge", y = "Tip_amount", title = "Boxplot of tip_amount vs improvement_surcharge", caption = "Outliers observed for improvement_surcharge") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$store_and_fwd_flag, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "store_and_fwd_flag", y = "Tip_amount", title = "Boxplot of tip_amount vs store_and_fwd_flag", caption = "Outliers observed for store_and_fwd_flag") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$extra, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "extra", y = "Tip_amount", title = "Boxplot of tip_amount vs extra", caption = "Outliers observed for extra") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$mta_tax, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "mta_tax", y = "Tip_amount", title = "Boxplot of tip_amount vs mta_tax", caption = "Outliers observed for mta_tax") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$PULocationID, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "PULocationID", y = "Tip_amount", title = "Boxplot of tip_amount vs PULocationID", caption = "Outliers observed for PULocationID") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$DOLocationID, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "DOLocationID", y = "Tip_amount", title = "Boxplot of tip_amount vs DOLocationID", caption = "Outliers observed for DOLocationID") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+ggplot(catData, aes(x=catData$congestion_surcharge, y=catData$tip_amount)) +
+  geom_boxplot(fill='steelblue') +
+  labs(x = "congestion_surcharge", y = "Tip_amount", title = "Boxplot of tip_amount vs congestion_surcharge", caption = "Outliers observed for congestion_surcharge") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic"))
+
+# get outlier counts: will remove these in Question 2
+# create new columns for z scores for numeric columns
+numericCol <- c("trip_distance", "fare_amount", "total_amount", "tip_amount")
+
+z <- function(x) { 
+  return((x-mean(x, na.rm=TRUE))/sd(x, na.rm=TRUE))}
+
+# create new names for new data
+names <- names(tripData_tx[numericCol])
+
+# apply to columns using sapply
+z_tripData_tx <- as.data.frame(sapply(tripData_tx[numericCol], z))
+colnames(z_tripData_tx) <- names
+
+# get counts of all outliers
+outlierCounts <- z_tripData_tx %>%  
+    dplyr::summarise(across(.cols = 1:4, ~ sum(abs(.) > 3, na.rm=TRUE)), .groups = 'drop')
+
+# take a look at the counts
+outlierCounts
+
+```
+There are 11 outliers in trip_distance, 12 outliers in fare_amount, 12 outliers in total_amount, and 23 outliers in tip_amount. These will be removed in Problem 2 at the same time as the remaining NAs. 
+
+## Feature Selection
+
+```{r}
+# remove fare_amount, highly colinear with total_amount
+# removed improvement_surcharge and extra, not significantly linearly correlated
+tripData_tx <- tripData_tx %>% 
+  select(-fare_amount,-store_and_fwd_flag,-improvement_surcharge,-trip_type)
+
+```
+
+For feature selection, I first removed fare_amount because it is highly colinear with total_amount. I also removed Store_and_fwd_flag: the vehicle memory is not pertinent to the tip amount. The improvement_surcharge and trip type did not seem to be correlated at all based on the ANOVA test. These were removed as well. 
+
+
+## Feature Engineering
+```{r}
+# take difference between pickup and dropoff and create new column: trip_time
+
+# first convert using lubridate
+tripData_tx$lpep_pickup_datetime <- ymd_hms(tripData_tx$lpep_pickup_datetime)
+tripData_tx$lpep_dropoff_datetime <- ymd_hms(tripData_tx$lpep_dropoff_datetime)
+
+# create new column trip_time by taking the difference
+tripData_tx$trip_time_hours <- with(tripData_tx, difftime(lpep_dropoff_datetime, lpep_pickup_datetime,units="hours") )
+
+# convert duration to numeric, also only keep month and year of date for pickup and dropoff
+tripData_fe <- tripData_tx %>%
+  # convert to just month and year, remove original data columns
+  mutate(PickupMonthDay = format(as.Date(lpep_pickup_datetime), "%m%d"), DropOffMonthDay = format(as.Date(lpep_dropoff_datetime), "%m%d"),lpep_pickup_datetime=NULL, lpep_dropoff_datetime=NULL) %>% 
+  mutate(across(c(PickupMonthDay,DropOffMonthDay), as.factor), trip_time_hours=as.numeric(trip_time_hours))
+
+# check to make sure new columns are correct
+glimpse(tripData_fe)
+```
+
+```{r}
+# evaluate new feature
+cor(tripData_fe$trip_time_hours, tripData_fe$tip_amount)
+
+# create visualization
+ggplot(tripData_fe) +
+  aes(x = trip_time_hours, y = tip_amount) +
+  geom_point(colour = "blue", na.rm=TRUE) + scale_x_log10() +
+  geom_smooth(method=lm) +
+  ggtitle("Trip Time in Hours vs Tip Amount") +
+  labs(caption = "The graph shows the time taken in hrs for each trip and the tip amount for respective trips. \nMost of the data points are concentrated at 0.05-1 trip_time_hr and 1-3 tip amount") +
+ theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic")
+  )
+
+# remove trip_time_hours
+tripData_fe <- tripData_fe %>% 
+  select(-trip_time_hours)
+
+# check PickupMonthDay and DropOffMonthDay as well (categorical vs continous)
+PUDO_anov <-  aov(tip_amount ~ PickupMonthDay+DropOffMonthDay, data=tripData_fe)
+summary(PUDO_anov)
+
+# remove PickupMonthDay and DropoffMonthDay from data
+tripData_fe <- tripData_fe %>% 
+  select(-PickupMonthDay, -DropOffMonthDay)
+```
+The Pearson's correlation between the trip_time_hours and the tip_amount is very low at 0.01. This indicates that this relationship will have limited functional applicability. I opted to remove this variable because of the lack of correlation. Looking at the scatterplot, there does appear to be a small relationship between these two variables; however, it is not significant. This could be due to the increased amount of 0 tips, which skews the data. 
+
+PickupMonthDay and DropoffMonthDay do not have significant relationships with tip_amount either (using ANOVA), with p-values of 0.349 and 0.929. These features were removed as well.
+
+# Question 2
+
+## Preprocess Data
+
+```{r}
+# check total number of NAs
+sum(is.na(tripData_fe))
+
+# turn outliers into NAs (identified in previous section)
+tripData_num <- tripData_tx %>% 
+  select(trip_distance, total_amount, tip_amount)
+
+z_tripData_tx <- z_tripData_tx %>% 
+  select(-fare_amount)
+
+# replace with NAs
+tripData_num[abs(z_tripData_tx) > 3] <- NA
+
+# replace current data columns with outliers replaced with NA
+tripData_fe[c("trip_distance","total_amount", "tip_amount")] <- tripData_num[c("trip_distance","total_amount", "tip_amount")]
+
+# 0s in passenger_count is an abnormal value, replace 0s with NA
+tripData_fe$passenger_count[tripData_fe$passenger_count == 0] <- NA
+
+# check total number of NAs
+sum(is.na(tripData_fe))
+
+```
+
+```{r}
+# remove all NAs
+tripClean <- na.omit(tripData_fe)
+
+# check number of NAs to make sure it worked
+sum(is.na(tripClean))
+```
+
+The outliers and the missing values were removed from the dataset. We originally attempted to impute these using knn, but it increased the number of 0s in the passenger_count(abnormal value). There are an increased amount of NAs in this data, which makes it difficult to predict them or impute them with mean/median without changing the data significantly and introducing a signficant amount of bias. First, we converted the outliers to NA. We also converted the 0 values of passenger count to NA and removed them, as this is an abnormal count and it does not make sense to have 0 passengers for a trip. Now there are 0 NAs and 0 outliers in the data. Data transformations and feature selection were performed in the previous question.
+
+## Normalizing the Data
+
+```{r}
+# create function for min max
+min_max <- function(x){
+  (x-min(x))/(max(x)-min(x))}
+
+# apply min max normalization to all numeric data, exclude target
+tripNorm <- tripClean %>% 
+  mutate(across(c(trip_distance, total_amount), min_max)) %>% 
+    relocate(tip_amount, .after = last_col())
+
+# check to make sure they normalized
+head(tripNorm)
+```
+
+## Encode the Data
+
+```{r}
+# encode the data using fastDummies: automatically turns categorical into dummy variables
+tripEnc <- dummy_cols(tripNorm, ignore_na=TRUE, remove_selected_columns = TRUE)
+
+# remove columns with all 0s 
+tripEnc <- tripEnc[, colSums(tripEnc != 0) > 0]
+
+# check the data
+head(tripEnc)
+```
+
+## Prepare the Data for Modeling
+```{r}
+# make sure its reproducible
+set.seed(10231)
+
+# split into train and test
+trip_index <- createDataPartition(tripEnc$tip_amount, p = .75, list = FALSE) 
+train_trip <- tripEnc[trip_index,] # 75% training data
+test_trip <- tripEnc[-trip_index,] # 25% testing data
+
+```
+
+To check the performance of a machine learning model, we split the entire data set into training set and testing set. As the name implies, training set is used to train the model and we need observations that aren't included in training to avoid bias during evaluation, this is called testing set. Testing data set is used to evaluate the performance and compare the model results with observed values.
+Training data is fed into the model to update parameters during learning phase. Later, after the training, we test the model using test set.
+The percentage split between testing and training sets doesn't have a simple answer. With less training set, the parameter estimates have a high variance while a less testing set leads to high variance in performance measures
+With smaller data sets, each data point is extremely valuable. To make sure the test set represents most of the variance, we've used a 75/25 split for training and testing data. Moreover, we've considered this split to be ideal to avoid overfitting and underfitting errors.
+
+# Problem 3
+
+```{r}
+# write function that runs knn and returns mse by taking train_trip, test_trip, k as parameters 
+knn.predict <- function(data_train, data_test, k){
+  pred <- FNN::knn.reg(train=data_train, test=data_test, y=data_train["tip_amount"], k=k)$pred
+  mse = mean((data_test$tip_amount - pred)^2)
+  return(mse)
+}
+
+# try it out
+knn.predict(train_trip, test_trip, 24)
+
+```
+
+The model performs pretty good as the Mean squared error of the knn is low.
+
+# Problem 4
+```{r}
+# create a for loop for k: 3:24
+MSE <- vector()
+
+for (k in 3:24) {
+  pred <- knn.predict(train_trip, test_trip, k=k)
+  MSE <- append(MSE, pred)
+}
+
+# take a look 
+MSE
+
+# create a line chart and plot each value of k
+ggplot() + geom_line(mapping=aes(x=seq(3,24), y=MSE)) +
+                       geom_point(mapping=aes(x=seq(3,24), y=MSE)) +
+                       ggtitle("k value versus MSE") +
+                       labs(x="k value", y="MSE", caption = "The graph shows optimized k-value for KNN algorithm. The MSE value is going down significantly \nfor k-value between 5 and 7.5 and continues to drop until it \ngets somewhat linear when k-value is between 15 and 25")
+
+```
+
+It is clear from the plot that as k value increases, MSE tends to decrease in most cases. 
+So having a higher k might help minimize MSE and achieve better accuracy.
+A higher k (>20)  would be the most suitable for this plot as it has the least MSE so the model model will perform the best with this k value.
+
+The mse value is very low, so we think this knn model will work well for future tip amount predictions. knn model does work well for smaller datasets like this one and it works by approximating the association between independent variables and the continuous outcome by averaging the observations in the same neighborhood. We are not sure if this model would work well on the larger dataset. Since knn is very sensitive to noise in the data, a larger dataset may adversely impact the model performance. Overall, while we would recommend this model for subsets of the data (such as in this case) due to the low MSE, we would not recommend its use on the full dataset. 
+
+# Problem 5
+```{r}
+# convert the numeric code to categorical text
+tripNorm$payment_type = with(tripNorm, factor(payment_type, 
+    levels = c('1', '2', '3', '4'), labels = c("Credit card", "Cash", "No charge", "Dispute")))
+
+# plot graph between passenger count and trip distance with payment_type fill
+ggplot(tripNorm,aes(passenger_count, fill=payment_type)) + geom_bar(position="stack") +  xlab("Passenger Count") + ylab("frequency") + ggtitle("Passenger count vs payment type") + labs(caption="passenger count with respect to the payment type")
+```
+
+We can see most of the passengers use credit card as a form of payment. 
+Cash is also used in pretty high terms.
+Passenger count of 1 have the highest frequency and 4 has the lowest. No charge, dispute are mostly never used.
+This data analysis can be used further for any deeper understanding of the passenger count with payment type.

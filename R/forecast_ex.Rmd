@@ -1,0 +1,169 @@
+---
+title: "Forecast.Kai.Saito"
+output: html_document
+date: "2022-11-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r}
+# import necessary libraries
+library(RCurl)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+```
+
+
+## Problem 1
+
+```{r}
+# download directly from URL
+
+data <- data.frame(read.csv("https://data.sfgov.org/api/views/rkru-6vcg/rows.csv?accessType=DOWNLOAD"))
+
+
+```
+
+```{r}
+# inspect data
+glimpse(data)
+
+# calculate frequency of missing values
+sapply(data, function(x) sum(is.na(x)))
+```
+## Problem 2
+
+```{r}
+
+# extract all domestic each year in March, then calculate total passengers for each time period
+domestic_march <- data %>% 
+  filter(GEO.Summary=="Domestic") %>% 
+  mutate(Date=ym(Activity.Period), Activity.Period=NULL) %>% 
+  mutate(Year=year(Date), Month=month(Date), Date=NULL) %>% 
+  filter(Month==3) %>% 
+  group_by(Year) %>% 
+  dplyr::summarize(total_passengers=sum(Passenger.Count))
+
+# take a look
+domestic_march
+
+# visualize extracted data using line chart
+ggplot(domestic_march, aes(x=Year, y=total_passengers)) + geom_line() +
+  ggtitle("Total Passengers in March of Every Year")
+```
+
+## Problem 3
+```{r}
+# forecast total passenger activity for March 2019 using simple moving average
+
+# use moving average for March in 2016-2018
+simple_ma <- sum(domestic_march[11:13,2])/3
+
+# get actual 
+actual_2019 <- domestic_march$total_passengers[domestic_march==2019]
+
+# calculate the error
+simple_ma_error <-  abs(simple_ma - actual_2019)*100/actual_2019
+
+# take a look
+simple_ma_error
+```
+The percent error for the simple moving average is about 1.85%. 
+
+## Problem 4
+```{r}
+# forecast total passenger activity for 2019 using a 3 year weighted average
+wa <- (sum(domestic_march[11:13,2] * c(3,5,7)))/(sum(3,5,7))
+
+# calculate the error compared to actual
+wa_error <- abs(wa - actual_2019)*100/actual_2019
+
+# take a look
+wa_error
+```
+The percent error for the 3 year weighted moving average is about 0.5%. This value is less than the simple moving average.
+
+## Problem 5
+```{r}
+# forecast total passenger activity for 2019 using exponential smoothing (alpha-0.7)
+
+# only do data for 2008 to 2018
+df <- domestic_march[3:13,]
+df$Ft_es <- 0
+df$E_es <- 0
+a= 0.7
+df$Ft_es[1] <- domestic_march$total_passengers[3]
+
+for (i in 2:nrow(df)) {
+  df$Ft_es[i] <- df$Ft_es[i-1] + a*df$E_es[[i-1]]
+  df$E_es[[i]] <- df[[i,2]] - df$Ft_es[i]
+}
+
+# get predicted value for 2019 
+es_pred <- df$Ft_es[11] + a*df$E_es[[11]]
+
+# calculate error for 2019
+es_error <- abs(es_pred - actual_2019)*100/actual_2019
+
+# take a look
+es_error
+
+```
+The percent error for the exponential smoothing method is about 1.3%. This value is less than the simple moving average but greater than the 3 year weighted average. 
+
+## Problem 6
+```{r}
+# build a simple linear regression model using year and total passenger activity for all data from 2008-2018
+
+# plot first to visualize, is it linear?
+ggplot(domestic_march[3:13,], aes(x=Year, y=total_passengers)) + geom_line() + ggtitle("Total Passengers from 2008-2018")
+
+# get model
+lm_model <-lm(total_passengers ~ Year, data=domestic_march[3:13,])
+
+# take a look at model
+lm_model
+
+# equation is   y= 131769x - 262394559 
+# forecast total passenger activity for 2019, 2020
+est_2019 <- 131769*2019  - 262394559 
+est_2019
+est_2020 <- 131769*2020  - 262394559 
+est_2020
+
+```
+
+The predicted value for 2019 using the linear regression model is 3647052, and the predicted value for 2020 is 3778821. 
+
+## Problem 7
+```{r}
+# calculate MSE for models in 5 and 6
+
+# for exponential smoothing, already have forecast and error for each time period, need to square error
+df <- df %>% 
+  mutate(Esqr_es = abs(E_es)^2)
+
+# for linear regression
+summary(lm_model)
+
+df$F_lm <- 0
+df$E_lm <- 0
+df$Esqr_lm <- 0
+
+for (i in 1:nrow(df)) {
+  df$F_lm[[i]] <- 131769*df$Year[i] - 262394559   
+  df$E_lm[[i]] <- abs(df[[i,2]] - df$F_lm[[i]])
+  df$Esqr_lm[[i]] <- df$E_lm[[i]]^2
+}
+
+# average squared errors
+mean(df$Esqr_es, na.rm=TRUE)
+mean(df$Esqr_lm, na.rm=TRUE)
+
+# which model has the smallest MSE
+```
+The linear regression model has the smaller MSE at 5017287840, compared to the exponential smoothing method which had an MSE of 34909605246.
+
