@@ -1,0 +1,1021 @@
+---
+title: "SaitoK.DA5030.Project"
+output: html_document
+date: "2022-11-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r}
+# load necessary packages
+library(plyr)
+library(tidyverse)
+library(googledrive)
+library(janitor)
+library(missRanger)
+library(psych)
+library(corrplot)
+library(FactoMineR)
+library(factoextra)
+library(fastDummies)
+library(ltm)
+library(caret)
+library(DMwR)
+library(scales)
+library(glmnet)
+library(C50)
+library(kernlab)
+library(nnet)
+library(AppliedPredictiveModeling)
+library(purrr)
+library(feamiR)
+library(MLmetrics)
+library(ROCR)
+```
+
+# CRISP-DM Process
+
+Intensive Care Unit patients historically have had high variability in their survival. As a result, many tools have been developed to assist medical professionals in determining survivability. One popular tool is creating a predictive model that can help medical personnel determine: Referral for surgery, best medications, and care guidelines. Currently, predictive scores like APACHE and SAPS-II are used to determine the general severity of disease in a patient. In this project, I will be exploring the Predict Mortality of ICU Patients dataset from physionet to see if I can create a different predictive mechanism for predicting ICU mortality. I will be comparing ANN, SVM, decision tree, and logistic regression models, then ensembling these models in order to improve our final model performance. 
+
+There are various benefits to being able to predict the mortality of ICU patients from the lab tests leading to the outcome. This data could help medical professionals make more informed decisions regarding patient patient treatment: this could improve patient outcome. Additionally, prediction of ICU mortality could allow doctors to identify high-risk patients so that they can be treated more aggressively in order to prevent this outcome. This data could allow hospitals/medical facilities to manage their resources (such as equipment and staffing) in order to prove the best patient care. 
+
+# Data Acquisition
+
+## Download Data and Merge
+```{r}
+# download data directly from url
+
+# for outcomes data
+outcomes_url <- "https://drive.google.com/uc?id=1RMbC-jgJB3gFDBHAMIFmlV8qrDfGOPJj&export=download"
+outcomesData <- read.csv(file=outcomes_url, header=TRUE)
+# only need record ID and outcomes from this dataset
+outcomesData <- outcomesData %>% 
+  dplyr::select(RecordID, In.hospital_death)
+
+# for lab tests and other patient info
+# create temp file
+temp <- tempfile(fileext = ".zip")
+# download using id (needs authentication)
+drive <- drive_download(as_id("1-bqST7NSbf7QmuD3HIrrdBFxlM3NFI38"), 
+path = temp, overwrite = TRUE)
+# unzip the file
+unzipped <- unzip(temp, exdir = tempdir())
+
+# loop through unzipped, skip outcomes (stored in [1])
+ptInfo <- vector(mode = "list", length = length(unzipped))
+
+for (i in 2:length(unzipped)){
+  data<- read.csv(unzipped[i], header=TRUE)
+
+    # summarize data: used mean of each parameter 
+  means <- data %>% 
+    group_by(Parameter) %>% 
+    dplyr::summarize(values=mean(Value)) %>% 
+    t() %>% 
+    row_to_names(row_number = 1) %>% 
+    as.data.frame()
+
+  # append to vector so they can be merged together
+  ptInfo[[i]] <- means 
+}
+
+# bind list of dataframes, fill where there is no data
+infoData <-  do.call(rbind.fill, ptInfo)
+
+# adjust RecordID data type
+infoData$RecordID <- as.character(as.integer(infoData$RecordID))
+
+# merge outcomesDat and infoData by RecordID
+mortData <- merge(infoData, outcomesData, by= "RecordID")
+
+# take a look
+head(mortData)
+```
+The dataset that inspired me to conduct this project came from Physionet/Computing in Cardiology Challenge 2012. To obtain the data, I downloaded the files from Kaggle but I needed to download it to google drive and create a global URL before loading it into R.The entire dataset  consists of 12,000 Intensive Care Unit stays (split into A, B, C) and preemptively excluded any case that had a stay less than 48 hours of admission to the ICU. The data  included cases that had “Do Not Resuscitate” and “Comfort Measures Only” directives. Set A consisted of 4,000 cases that had outcomes provided while B and C consisted of 8,000 cases that had their outcomes withheld. Because the outcomes were withheld, I could not use them in the analysis. So, I split set A into train data and test data.  
+
+There were 42 variables recorded that were recorded at least once within 48 hours of admission of the ICU and some of these variables were not applicable to all cases. There were 6 general descriptor variables taken once at the start of admission and 36 time series variables taken multiple times throughout the ICU stay. Each patient record was stored as a separate text file. To download all of the data, I had to download it as a zip file that contained all the train data. Then, I looped through the unzipped files to read each CSV and summarized each lab test using the mean. I then merged the cases into one file by RecordID.
+
+# Data Exploration, Cleaning, & Shaping
+
+## Identification of Missing or Duplicated Values, Data Adjustments
+```{r}
+#  get dimensions of data
+dim(mortData)
+
+# look at overall structure
+str(mortData)
+
+# gender, ICU Type, and in hospital death should be factor, everything else numeric
+mortData <- mortData %>% 
+  mutate_if(is.character,as.numeric) %>% 
+  mutate(Gender=as.factor(Gender),
+  In.hospital_death=as.factor(In.hospital_death),
+  ICUType=as.factor(ICUType))
+
+# check for frequency of missing values
+sapply(mortData, function(x) sum(is.na(x)))
+
+# check for duplicated values 
+sum(duplicated(mortData))
+
+# remove features that have >50% NAs, will impute the rest
+# also remove RecordID,  don't need it anymore since its merged
+mortData <- mortData %>% 
+  dplyr::select(-TroponinI, -TroponinT,-Cholesterol, -Albumin, 
+         -Bilirubin, -AST, -SaO2, -ALP, -ALT, -RecordID, -RespRate)
+
+# check distribution of target data
+prop.table(table(mortData$In.hospital_death))
+```
+
+There are a lot of missing values and the data is imbalanced. Features that have >50% NAs were removed, because I cannot accurately impute them. The remaining features will be imputed using random forest at the same time as the outliers. I will have to account for the imbalanced data by oversampling or undersampling (using SMOTE).
+
+## Detecting outliers, Imputing NAs
+
+```{r}
+# take a look at boxplots of continuous data
+featurePlot(x = mortData[, map_lgl(mortData, is.numeric)], 
+            y = mortData$In.hospital_death, 
+            plot = "box", 
+            scales = list(y = list(relation="free"),
+                          x = list(rot = 90)),  
+            layout = c(4,1 ), 
+            auto.key = list(columns = 2))
+
+# take a look at boxplots of categorical data
+boxplot(mortData[, map_lgl(mortData, is.factor)])
+
+# create function for z score
+z.score <- function(x) { 
+  return((x-mean(x, na.rm=TRUE))/sd(x,na.rm=TRUE))}
+
+# create new names
+names <- paste(names(mortData[, map_lgl(mortData, is.numeric)]), sep="")
+
+# apply to all columns
+mortData_z <- as.data.frame(sapply (mortData[, map_lgl(mortData, is.numeric)], z.score))
+colnames(mortData_z) <- names
+
+# get counts of all outliers
+mortData_z %>%  
+    dplyr::summarise(across(.cols = 0:29, ~ sum(abs(.) > 3)), .groups = 'drop')
+
+# check number of NAs
+sum(is.na(mortData))
+
+# temporarily remove categorical from mortData
+mortDataNum <- mortData %>%  
+  dplyr::select(-In.hospital_death,-Gender,-ICUType)
+
+# replace outliers with NA
+mortDataNum[abs(mortData_z) > 3] <- NA
+
+# check number of NAs again
+sum(is.na(mortDataNum))
+
+# replace negative values with NA
+mortDataNum[mortDataNum<0] <- NA
+
+# check count of NAs
+sum(is.na(mortDataNum))
+
+# make sure there are no missing values in target
+sum(is.na(mortDataNum$In.hospital_death))
+
+# add categorical features back in 
+mortData <- cbind(mortData[, map_lgl(mortData, is.factor)], mortDataNum)
+
+# impute NAs with missRanger
+mortImp <- missRanger(mortData)
+
+# take a look at imputed data
+head(mortImp)
+
+```
+First, the outliers were replaced with NA so that they can be imputed. Additionally, in this dataset, a value of -1 indicates missing/unknown data. Since lab values, age, height, etc cannot be negative, all of the negative values were replaced with NA, then imputed using random forest with missRanger.
+
+
+## Correlation  Analysis 
+
+```{r}
+# move in hospital death to the end
+mortImp <- mortImp %>%  relocate(In.hospital_death, .after = last_col())
+
+# get just continuous features into a different dataset
+mortNum <- mortImp[,-which(names(mortImp) %in% c( "ICUType", "Gender", "In.hospital_death"))]
+  
+# first look at feature importance by ROC curve
+rocImp <- as.data.frame(caret::filterVarImp(x = mortImp[,1:31], y = mortImp$In.hospital_death, nonpara=TRUE))
+
+# reorder
+rocImp <- rocImp %>% 
+  arrange(desc(X0))
+
+# take a look
+rocImp
+
+# create correlation matrix of numeric data
+mort.cor <- cor(x = mortNum, use='complete.obs')
+
+# take a look
+mort.cor
+
+# use corrplot to visualize
+corrplot(mort.cor, method = "circle", tl.col = "black")
+
+# remove mechvent from data
+mortImp <- mortImp %>% 
+  dplyr::select(-MechVent)
+
+# target is categorical with two levels, can use biserial correlation between continuous and target
+bis.cor <- as.data.frame(sapply(1:ncol(mortNum), function(i) biserial.cor(mortNum[,i], mortImp$In.hospital_death)))
+
+# set names 
+cor.names <- names(mortNum)
+
+# add names to data
+rownames(bis.cor) <- cor.names
+colnames(bis.cor) <- c("biserial.correlation")
+
+# reorder data
+bis.cor <- bis.cor %>% 
+  arrange(desc(biserial.correlation))
+
+# take a look
+bis.cor
+
+# chi squared for between categorical
+chisq.test(mortImp$Gender, mortImp$In.hospital_death)
+chisq.test(mortImp$ICUType, mortImp$In.hospital_death)
+
+```
+I performed corrleation analysis in various ways: ROC curve, Pearson's for the numeric variables, biserial correlation, and chi-squared. There are some collinarities between the continuous features using Pearson's, but overall most of the features do not appear to be colinear from each other. BUN and Creatinine, PaCO2 and HCO3, NiMAP and NiSysABP, MAP and DiasABP, as well as SysABP and MAP seem to be highly correlated with each other; however, the correlations were not so high that it warranted removing these features. On the other hand, there is no variance to MechVent and it appears that all patients were mechanically vented. Since this column does not provide any information, I removed it. 
+
+Using ROC curve analysis on each predictor (both continuous and categorical), the correlations were ordered. The most correlated were BUN, Urine, and GCS. I then used biserial corrrelation to test the relationship strength between each of the continuous features and the target variable of in hospital death. GCS, Urine, and HCO3 seemed to be the most correlated In hospital death from this test. The results are similar but not identical. 
+
+I cannot run biserial correlation if the two features being compared are both categorical, so I performed a chi-squared analysis for the Gender and the ICU Type. According to these tests, ICU type is significantly correlated with In Hospital Death, but Gender is not. 
+
+Since each model may have different features it considered significant for the performance of the model, I decided to do recursive feature selection on each model instead. 
+
+## Distribution Analysis and Transformation
+
+```{r}
+# take a look at distributions/correlations
+# break into two to make it easier to see
+pairs.panels(mortImp[,c(1:15,31)])
+pairs.panels(mortImp[,c(16:31)])
+
+# transform non-normal features
+mortDist <- mortImp %>% 
+   mutate(pH=log(pH),
+          Lactate=sqrt(Lactate),
+          Age=log(Age),
+          BUN=sqrt(BUN),
+          Creatinine=log(Creatinine), 
+          GCS=log(GCS),
+          HCT=sqrt(HCT))
+          
+# check to make sure they transformed correctly
+pairs.panels(mortDist[, c("pH", "Lactate", "Age", "BUN",
+"Creatinine", "GCS", "HCT")])
+
+```
+HCO3, HCT, HR, K, Mg, Na, Glucose, NIMAP, NiSysMAP, Platelet, Temp, Urine, WBC, Weight, DiasABP, FiO2, MAP, FaCO2, PaO2, and SysABP appear to all be normally distributed. Ph, lactate, Age, BUN, Creatinine, GCS, and HCT are all skewed. A squareroot transform was performed on Lactate, BUN, and HCT, and a log transform was performed on pH, Age, Creatinine, and GCS since the square root transform did not normalize them as much as the log transform did. pH, GCS, and Age still do not appear to be normally distributed: 
+
+## Feature Engineering New Derived Features
+
+```{r}
+# create new derived features by combining some categories
+mortDistDer <- mortDist %>% 
+  rowwise() %>%
+  mutate(sepsis=mean(c(WBC,PaO2,Platelets,HR,Temp,Lactate)),
+        kidney=mean(c(BUN,Creatinine,Urine)),
+        cardiac=mean(c(HR,K,SysABP,DiasABP))) %>% 
+    relocate(In.hospital_death, .after = last_col())
+  
+```
+
+Sepsis was an area of interest as it is a large contributor to in hospital deaths. Many common healthcare emergencies lead to sepsis which then leads to shock and death. I decided to include WBC, Platelets, temperature, and lactate as all of these will increase in the event of sepsis. Kidney function is an important indicator of patient health since kidney failure is another complication of common healthcare emergencies. I decided to include BUN, Creatinine and Urine as these are iconic lab values that increase with worsening kidney function. Lastly, cardiac problems are another common complication from many healthcare emergencies. I included HR, K, SysABP, and DiasABP since all of these can increase with cardiac complications. By including these values into three categories, it can give valuable information for a doctor to predict if a patient will develop one of these complications which will threaten their survival and resulting in more resources for the doctor to provide the patient. I decided to use the mean as a summarized version of these lab tests.
+
+## Identification of Principle Components (PCA)
+
+```{r}
+# perform PCA to see how much of variance is explained by each feature
+famd <- FAMD(mortDistDer, graph = FALSE)
+
+# draw the scree plot: percentages of inertia explained by each FAMD dimensions
+fviz_screeplot(famd)
+
+# visualize quantitative variables
+fviz_famd_var(famd, "quanti.var", repel = TRUE,
+              col.var = "contrib")
+
+# color individuals by In hospital death
+fviz_mfa_ind(famd, 
+             habillage = "In.hospital_death", 
+             addEllipses = TRUE, ellipse.type = "confidence", 
+             repel = TRUE
+             ) 
+
+```
+I performed PCA using FAMD because this function can handle mixed data well, and I have both categorical and continuous data. The scree plot allows us to visualize the percentages of inertia explained by each of the FAMD dimensions. The visualization of the quantitative variables demonstrates the correlation between features and the dimension 1 by utilizing a color gradient. I then colored the individuals by In Hospital Death to see if I could differentiate the two groups. Since I will be performing recursive feature elimination, I did not eliminate features based on this PCA analysis. 
+
+## Dummy Code Categorical Features
+
+```{r}
+# SVM requires inputs to be numeric, dummy coded ICU Type
+mortDummy <- mortDistDer %>% 
+  mutate(Gender=as.numeric(as.character(Gender)),
+         In.hospital_death=as.numeric(as.character(In.hospital_death))) %>% 
+  dummy_cols(remove_selected_columns =TRUE) %>% 
+  relocate(In.hospital_death, .after = last_col())
+  
+# change target to factor
+mortDummy$In.hospital_death <- as.factor(mortDummy$In.hospital_death)
+```
+ 
+Since ANN and SVM require inputs to be numeric, I dummy coded the ICU type. Gender is binary (0,1) and therefore does not need to be dummy coded. The outcome, though a factor, also does not need to be dummy coded because it is the target and is also binary.
+
+# Model Construction
+
+## Creation of Training and Validation Subsets
+```{r}
+# create random seed to make it reproducible
+set.seed(123)
+
+# change to dataframe
+mortDistDer <- as.data.frame(mortDistDer)
+# create index to split into train and tests
+mort_index <- createDataPartition(mortDistDer$In.hospital_death, p = 0.70,
+    list = FALSE)
+
+# split into train and test for classification tree and logistic regression
+mortMix_train <- mortDistDer[mort_index, ]
+mortMix_val <- mortDistDer[-mort_index,]
+
+# split into train and test for ANN and SVm
+mortNum_train <- mortDummy[mort_index, ]
+mortNum_val <- mortDummy[-mort_index,]
+
+# Check distributions of target
+prop.table(table(mortMix_train$In.hospital_death))
+prop.table(table(mortMix_val$In.hospital_death))
+
+# oversample train data
+overMixTrain <- DMwR::SMOTE(In.hospital_death~., as.data.frame(mortMix_train), perc.over=750, perc.under=114)
+overNumTrain <- DMwR::SMOTE(In.hospital_death~., as.data.frame(mortNum_train), perc.over=750, perc.under=114)
+
+# check new distributions
+prop.table(table(overMixTrain$In.hospital_death))
+prop.table(table(overNumTrain$In.hospital_death))
+
+# save labels for later
+train_labels <- overMixTrain$In.hospital_death
+val_labels <- mortMix_val$In.hospital_death
+
+```
+Since regression tree, and logistic regression can handle categorical data, I created two train and test sets: one from the non-dummy coded data and one for the dummy coded data, which will be utilized for ANN and SVM. Since these datasets have the same number of rows, only one index is necessary. 
+
+Because the data is so unbalanced(85:15), I over-sampled the training data using SMOTE. The target variable distributions in the train data are now approximately equal. I decided on a 70/30 split for training and test in order to avoid overfitting. The data is not very small, so this split should work. 
+
+## Feature Normalization 
+```{r}
+# normalize all continuous features in train to -1 to 1 using rescale for mixed data
+normMixTrain <- overMixTrain  
+
+normMixTrain[,-which(names(normMixTrain) %in% c("In.hospital_death", "ICUType", "Gender"))] <- lapply(normMixTrain[,-which(names(normMixTrain) %in% c("In.hospital_death", "ICUType", "Gender"))], scales::rescale, to=c(-1,1))
+
+# normalize test continuous features using min/max of train
+normMixVal <- mortMix_val
+
+normMixVal[,-which(names(normMixTrain) %in% c("In.hospital_death", "ICUType", "Gender"))] <- sapply(names(overMixTrain[,-which(names(normMixTrain) %in% c("In.hospital_death", "ICUType", "Gender"))]), function(x) {(normMixVal[[x]]-min(overMixTrain [[x]]))/(max(overMixTrain[[x]])-min(overMixTrain [[x]]))})
+
+# normalize all continuous features in Num Train using rescale (not dummy variables)
+normNumTrain <- overNumTrain
+
+normNumTrain[,-which(names(normNumTrain) %in% c("In.hospital_death", "ICUType_1", "ICUType_2", "ICUType_3", "ICUType_4","Gender"))] <- lapply(normNumTrain[,-which(names(normNumTrain) %in% c("In.hospital_death", "ICUType_1", "ICUType_2", "ICUType_3", "ICUType_4","Gender"))], scales::rescale, to=c(-1,1))
+
+# normalize test continuous features using min/max of train
+normNumVal <- mortNum_val
+
+normNumVal[,-which(names(normNumTrain) %in% c("In.hospital_death", "ICUType_1", "ICUType_2", "ICUType_3", "ICUType_4","Gender"))] <- sapply(names(overNumTrain[,-which(names(normNumTrain) %in% c("In.hospital_death", "ICUType_1", "ICUType_2", "ICUType_3", "ICUType_4","Gender"))]), function(x) {(normNumVal[[x]]-min(overNumTrain [[x]]))/
+                                                                                                (max(overNumTrain [[x]])-min(overNumTrain [[x]]))})
+
+# take a look to make sure it normalized
+head(normMixTrain)
+head(normMixVal)
+head(normNumTrain)
+head(normNumVal)
+
+# change level names for calculating class probabilities
+levels(normMixTrain$In.hospital_death) <- c("Survived", "Deceased")
+levels(normMixVal$In.hospital_death) <- c("Survived", "Deceased")
+levels(normNumTrain$In.hospital_death) <- c("Survived", "Deceased")
+levels(normNumVal$In.hospital_death) <- c("Survived", "Deceased")
+
+# convert labels
+levels(train_labels) <-  c("Survived", "Deceased")
+levels(val_labels) <-  c("Survived", "Deceased")
+
+```
+In a typical test setting, I would not have the test data at the same time as the train data; therefore, I normalized the train data first using rescale to -1 to 1, then I normalized the test continuous features using the min/max of the train data. I also changed the labels of the levels to make it easier for classProbs in caret to get the class probabilities. 
+
+# Creation of Logistic Regression Model
+
+```{r}
+# set seed to make sure its reproducible
+set.seed(123)
+# create base model with no regularization, no hyperparameter tuning
+base_logreg <- glm(In.hospital_death ~., data=normMixTrain, family=binomial)
+
+# check summary
+summary(base_logreg)
+
+# look up the model in caret
+modelLookup("glmnet")
+
+# glmnet has internal feature selection, no need for rfe
+# train the control for k fold cross validation 
+ctrl <- trainControl(method="cv", number=10,
+                     selectionFunction="oneSE",
+                     classProbs=TRUE,
+                     summaryFunction=prSummary)
+
+# create grid for hyperparameter optimization
+lrGrid <- expand.grid(alpha = seq(0,1,by=0.1), lambda=seq(0,1,by=0.1))
+
+# create model
+logreg <- train(In.hospital_death ~., data=normMixTrain, method="glmnet", metric="ROC", trControl=ctrl,
+           tuneGrid=lrGrid)
+
+# take a look at the model
+logreg
+
+# check variable importances
+varImp(object=logreg)
+
+# plot results
+plot(logreg)
+
+```
+
+I utilized glm for the base model, because it does not perform any regularization. For the optimized model, I used glmnet. Since glmnet has a built-in feature selection mechanism, I did not perform a separate recursive feature elimination with caret. I did, however, perform hyperparameter tuning by creating a grid of values for alpha and lambda. The hyperparameter tuning was combined with k-fold cross validation in order to maximize the model performance. Since the data is inherently imbalanced (I did balance the data using SMOTE), I used AUC instead of Acccuracy for the metric. 
+
+## Creation of Classification Tree Model
+
+```{r}
+# set seed to make sure its reproducible
+set.seed(123)
+# create base model with no feature elim, no hyperparameter tuning
+base_tree <- C5.0(In.hospital_death ~., data=normMixTrain)
+
+# look up C5.0 model for classification tree in caret
+modelLookup("C5.0")
+
+# create control for recursive feature elimination 
+rfectrl <- rfeControl(functions = treebagFuncs,
+                      method = "cv",
+                      number =5)
+
+# run recursive feature elimination
+treeParam <- rfe(x = normMixTrain[,!(colnames(normMixTrain) == "In.hospital_death")],
+  y = normNumTrain$In.hospital_death, sizes=c(2, 5, 10, 20),method="C5.0", rfeControl=rfectrl)
+
+# take a look
+treeParam
+
+# get predictors, all used
+predictors(treeParam)
+
+# only use top 15 features
+treeParam$optVariables[1:15]
+
+# train the control for k fold cross validation
+ctrl <- trainControl(method="cv", number=10,
+                     selectionFunction="oneSE",classProbs=TRUE,
+                     summaryFunction=prSummary)
+
+# create grid for hyperparameter optimization
+treeGrid <- expand.grid(model="tree", trials = c(1,5,10,5,20,25,30), winnow=FALSE)
+
+# run hyperparameter tuning with k fold cross validation
+tree <- train(In.hospital_death ~GCS+Urine+BUN+kidney+Height+Age+Creatinine+Glucose+PaCO2+HCO3+
+                HCO3+Lactate+SysABP+HR+K+Na, data=normMixTrain, method="C5.0", metric="ROC", trControl=ctrl,
+           tuneGrid=treeGrid)
+
+# take a look at model
+tree
+
+# take a look at cross validation results
+plot(tree)
+```
+
+Decision trees are very versatile and are a good choice for classification; however, they do have a tendency to overfit. I first created a base model using C5.0, then I performed recursive feature elimination on the C5.0 model using the treebagFuncs. I originally took the best parameters (all of them in this case) that were outputted from the recursive feature elimination and used that for the training of my model; however, that resulted in overfitting so I decided to take the top 10 features instead. I utilized oneSE as the selection function and kept prSummary as the summary function, as that outputs AUC, precision, and recall. I utilized hyperparameter tuning to get the best value for trials.  
+
+## Creation of ANN Model
+
+```{r}
+# set seed to make sure its reproducible
+set.seed(123)
+# create base model with no feature elim, no hyperparameter tuning
+base_ann<- nnet(formula=In.hospital_death ~., data=normNumTrain, size=1)
+
+# take a look
+base_ann
+
+# look up the model in caret
+modelLookup("nnet")
+
+# create control for recursive feature elimination 
+rfectrl <- rfeControl(functions = caretFuncs,
+                      method = "cv",
+                      number =5)
+
+# run recursive feature elimination
+annParam <- rfe(x = normNumTrain[,!(colnames(normNumTrain) == "In.hospital_death")],
+  y = normMixTrain$In.hospital_death, sizes=c(2, 5, 10, 20),method="nnet", 
+  rfeControl=rfectrl, trace=FALSE)
+
+# get features, all were chosen
+predictors(annParam)
+
+# original model was overfitting, used top 15 features instead
+annParam$optVariables[1:15]
+
+# train the control for k fold cross validation 
+ctrl <- trainControl(method="cv", number=10,
+                     selectionFunction="oneSE",
+                     classProbs=TRUE,
+                     summaryFunction=prSummary)
+
+# create grid for hyperparameter optimization
+annGrid <- expand.grid(size=c(seq(1,10,by=1),20), decay=c(0.5, 0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6))
+
+# create ann model
+ann <- train(In.hospital_death ~BUN+NIMAP+Mg+pH+Age+Height+Creatinine+
+               DiasABP+GCS+Lactate+NISysABP+ICUType_2+ICUType_3+NIDiasABP+MAP,data=normNumTrain, method="nnet", metric="ROC", trControl=ctrl,
+           tuneGrid=annGrid, trace=FALSE) 
+
+# take a look at the model
+ann
+
+# visualize network topology
+plot(ann, rep="best")
+```
+
+For ANN, I opted to use the nnet package. I performed recursive feature elimination, and only inputted the 10 best parameters for the model. Originally, I had used all the features as rfe showed; however, this led to overfitting so I chose to decrease this to the top 15 features. I tuned the decay and the size parameters, and utilized oneSE for the selection function. This rule is in agreement with the "one standard error" from Breiman, which suggested that the tuning parameter associated with the best performance may tend to overfit. In this rule, the simplest model w/in one standard error of the optimal model is chosen as the best choice. 
+
+# Creation of SVM Model
+
+```{r}
+# set seed to make sure its reproducible
+set.seed(123)
+# create base model with no feature elim, no hyperparameter tuning
+# svmLinear uses linear kernel from ksvm from kernlab
+base_svm<- ksvm(In.hospital_death ~., data=normNumTrain, kernel="vanilladot", prob.model=TRUE)
+
+# take a look 
+base_svm
+
+# look up linear svm
+modelLookup("svmLinear")
+
+# create control for recursive feature elimination 
+rfectrl <- rfeControl(functions = caretFuncs,
+                      method = "cv",
+                      number =5)
+
+# run recursive feature elimination
+svmParam <- rfe(x = normNumTrain[,!(colnames(normNumTrain) == "In.hospital_death")],
+  y = normNumTrain$In.hospital_death, sizes=c(2, 5, 10, 20),method="svmLinear", 
+  rfeControl=rfectrl)
+
+# get ideal features
+predictors(svmParam)
+
+# original model was overfitting, used top 15 features instead
+svmParam$optVariables[1:15]
+
+# train the control for k fold cross validation 
+ctrl <- trainControl(method="cv", number=10,
+                     selectionFunction="oneSE",
+                     classProbs=TRUE)
+
+# create grid for hyperparameter optimization
+svmGrid <- expand.grid(C=c(1e-3, 1e-4, 1e-5, seq(0.01,0.05,by=0.01),1,10,50))
+
+# create support vector machine tree model
+svm <- train(In.hospital_death ~ GCS+BUN+Urine+kidney+HCO3+Creatinine+Age+
+               PaCO2+Glucose+Lactate+ICUType_2+DiasABP+SysABP+NIMAP+ICUType_3, 
+             data=normNumTrain,
+             method="svmLinear", metric="Kappa", trControl=ctrl,
+           tuneGrid=svmGrid)
+
+# take a look at model
+svm 
+
+# take a look at cross validation results
+plot(svm)
+```
+
+For SVM, I decided to use a linear kernel within ksvm. In the caret documentation, it stated that svmLinear utilizes kernlab's ksvm function; therefore, these two should be equivalent. I performed recursive feature elimination and optimized the C parameter. The C parameter, or the regularization parameter, is a critical value that allows you to control the degree of importance given to mis-classifications. I utilized the 15 best parameters for this model: although I had used all of them originally (output from rfe), the model was overfit so I decided to reduce the number of features for this model and ANN.
+
+# Model Evaluation
+
+## Creation of Predictions
+```{r}
+# predictions for base and optimized logistic regression (both train and test)
+baselogregTrain <- predict(base_logreg, normMixTrain[-34],type="response")
+baselogregTest <- predict(base_logreg, normMixVal[-34],type="response")
+baselogregTrain  <- factor(ifelse(baselogregTrain >= 0.5, "Deceased", "Survived"))
+baselogregTest <-  factor(ifelse(baselogregTest >= 0.5, "Deceased", "Survived"))
+
+logregTrain <- predict(logreg, normMixTrain[-34])
+logregTest <- predict(logreg, normMixVal[-34])
+
+# predictions base and optimized decision tree (both train and test)
+basetreeTrain <- predict(base_tree, normMixTrain[-34])
+basetreeTest <- predict(base_tree, normMixVal[-34])
+treeTrain <- predict(tree, normMixTrain[-34])
+treeTest <- predict(tree, normMixVal[-34])
+
+# predictions base and optimized ANN (both train and test)
+baseannTrain <- predict(base_ann, normNumTrain[-37],type="class")
+baseannTest <- predict(base_ann, normNumVal[-37],type="class")
+annTrain <- predict(ann, normNumTrain[-37],type="raw")
+annTest <- predict(ann, normNumVal[-37],type="raw")
+
+# predictions base and optimizedSVM (both train and test)
+basesvmTrain <- predict(base_svm, normNumTrain[-37])
+basesvmTest <- predict(base_svm, normNumVal[-37])
+svmTrain <- predict(svm, normNumTrain[-37])
+svmTest <- predict(svm, normNumVal[-37])
+
+```
+
+```{r}
+# create table to store model parameters for all to compare
+tab <- matrix(rep(0, times=60), ncol=6, byrow=TRUE)
+colnames(tab) <- c('Accuracy', 'Kappa', 'Precision', 
+'Recall', 'F1' , 'AUC')
+rownames(tab) <- c('LogRegTrain', 'LogRegTest', 'TreeTrain', 'TreeTest',
+                   'ANNTrain', 'ANNTest', 'SVMTrain', 'SVMTest', 
+                   'EnsTrain','EnsTest')
+  
+# create tables to compare base vs optimized
+logregComp <- matrix(rep(0, times=24), ncol=6, byrow=TRUE)
+colnames(logregComp) <- c('Accuracy', 'Kappa', 'Precision', 
+'Recall', 'F1' , 'AUC')
+rownames(logregComp) <- c('base_LogRegTrain', 'base_LogRegTest', 'LogRegTrain', 'LogRegTest')
+
+treeComp <- matrix(rep(0, times=24), ncol=6, byrow=TRUE)
+colnames(treeComp) <- c('Accuracy', 'Kappa', 'Precision', 
+'Recall', 'F1' , 'AUC')
+rownames(treeComp) <- c('base_TreeTrain', 'base_TreeTest', 'TreeTrain', 'TreeTest')
+
+annComp <- matrix(rep(0, times=24), ncol=6, byrow=TRUE)
+colnames(annComp) <- c('Accuracy', 'Kappa', 'Precision', 
+'Recall', 'F1' , 'AUC')
+rownames(annComp) <- c('base_ANNTrain', 'base_ANNTest', 'ANNTrain', 'ANNTest')
+
+svmComp <- matrix(rep(0, times=24), ncol=6, byrow=TRUE)
+colnames(svmComp) <- c('Accuracy', 'Kappa', 'Precision', 
+'Recall', 'F1' , 'AUC')
+rownames(svmComp) <- c('base_SVMTrain', 'base_SVMTest', 'SVMTrain', 'SVMTest')
+```
+
+I created tables for all comparisons to make it easier to visualize.
+
+## Extract Accuracy, Precision, Recall, and F1 scores, AUC from Confusion Matrices
+```{r}
+# confusion matrices for logistic regression
+basecmLogTrain <- confusionMatrix(as.factor(baselogregTrain), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+basecmLogTest <- confusionMatrix(as.factor(baselogregTest), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmLogTrain <- confusionMatrix(as.factor(logregTrain), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmLogTest <- confusionMatrix(as.factor(logregTest), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+
+# confusion matrices for classification  tree
+basecmTreeTrain <- confusionMatrix(as.factor(basetreeTrain), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+basecmTreeTest <- confusionMatrix(as.factor(basetreeTest), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmTreeTrain <- confusionMatrix(as.factor(treeTrain), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmTreeTest <- confusionMatrix(as.factor(treeTest), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+
+# confusion matrices for ann
+basecmANNTrain <- confusionMatrix(as.factor(baseannTrain), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+basecmANNTest <- confusionMatrix(as.factor(baseannTest), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmANNTrain <- confusionMatrix(as.factor(annTrain), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmANNTest <- confusionMatrix(as.factor(annTest), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+
+# confusion matrices for svm
+basecmSVMTrain <- confusionMatrix(as.factor(basesvmTrain), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+basecmSVMTest <- confusionMatrix(as.factor(basesvmTest), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmSVMTrain <- confusionMatrix(as.factor(svmTrain), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmSVMTest <- confusionMatrix(as.factor(svmTest), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+
+# get accuracies
+logregComp[1:4,1] <- c(basecmLogTrain$overall[['Accuracy']], basecmLogTest$overall[['Accuracy']],
+                       cmLogTrain$overall[['Accuracy']],cmLogTest$overall[['Accuracy']])
+treeComp[1:4,1] <- c(basecmTreeTrain$overall[['Accuracy']], basecmTreeTest$overall[['Accuracy']],
+                       cmTreeTrain$overall[['Accuracy']],cmLogTest$overall[['Accuracy']])
+annComp[1:4,1] <- c(basecmANNTrain$overall[['Accuracy']], basecmANNTest$overall[['Accuracy']],
+                       cmANNTrain$overall[['Accuracy']],cmANNTest$overall[['Accuracy']])
+svmComp[1:4,1] <- c(basecmSVMTrain$overall[['Accuracy']], basecmSVMTest$overall[['Accuracy']],
+                       cmSVMTrain$overall[['Accuracy']],cmSVMTest$overall[['Accuracy']])
+
+
+# get kappa
+logregComp[1:4,2] <- c(basecmLogTrain$overall[['Kappa']], basecmLogTest$overall[['Kappa']],
+                       cmLogTrain$overall[['Kappa']],cmLogTest$overall[['Kappa']])
+treeComp[1:4,2] <- c(basecmTreeTrain$overall[['Kappa']], basecmTreeTest$overall[['Kappa']],
+                       cmTreeTrain$overall[['Kappa']],cmLogTest$overall[['Kappa']])
+annComp[1:4,2] <- c(basecmANNTrain$overall[['Kappa']], basecmANNTest$overall[['Kappa']],
+                       cmANNTrain$overall[['Kappa']],cmANNTest$overall[['Kappa']])
+svmComp[1:4,2] <- c(basecmSVMTrain$overall[['Kappa']], basecmSVMTest$overall[['Kappa']],
+                       cmSVMTrain$overall[['Kappa']],cmSVMTest$overall[['Kappa']])
+
+# get precision
+logregComp[1:4,3] <- c(basecmLogTrain$byClass[['Precision']], basecmLogTest$byClass[['Precision']],
+                       cmLogTrain$byClass[['Precision']],cmLogTest$byClass[['Precision']])
+treeComp[1:4,3] <- c(basecmTreeTrain$byClass[['Precision']], basecmTreeTest$byClass[['Precision']],
+                       cmTreeTrain$byClass[['Precision']],cmLogTest$byClass[['Precision']])
+annComp[1:4,3] <- c(basecmANNTrain$byClass[['Precision']], basecmANNTest$byClass[['Precision']],
+                       cmANNTrain$byClass[['Precision']],cmANNTest$byClass[['Precision']])
+svmComp[1:4,3] <- c(basecmSVMTrain$byClass[['Precision']], basecmSVMTest$byClass[['Precision']],
+                       cmSVMTrain$byClass[['Precision']],cmSVMTest$byClass[['Precision']])
+
+# get recall
+logregComp[1:4,4] <- c(basecmLogTrain$byClass[['Recall']], basecmLogTest$byClass[['Recall']],
+                       cmLogTrain$byClass[['Recall']],cmLogTest$byClass[['Recall']])
+treeComp[1:4,4] <- c(basecmTreeTrain$byClass[['Recall']], basecmTreeTest$byClass[['Recall']],
+                       cmTreeTrain$byClass[['Recall']],cmLogTest$byClass[['Recall']])
+annComp[1:4,4] <- c(basecmANNTrain$byClass[['Recall']], basecmANNTest$byClass[['Recall']],
+                       cmANNTrain$byClass[['Recall']],cmANNTest$byClass[['Recall']])
+svmComp[1:4,4] <- c(basecmSVMTrain$byClass[['Recall']], basecmSVMTest$byClass[['Recall']],
+                       cmSVMTrain$byClass[['Recall']],cmSVMTest$byClass[['Recall']])
+
+# get F1
+logregComp[1:4,5] <- c(basecmLogTrain$byClass[['F1']], basecmLogTest$byClass[['F1']],
+                       cmLogTrain$byClass[['F1']],cmLogTest$byClass[['F1']])
+treeComp[1:4,5] <- c(basecmTreeTrain$byClass[['F1']], basecmTreeTest$byClass[['F1']],
+                       cmTreeTrain$byClass[['F1']],cmLogTest$byClass[['F1']])
+annComp[1:4,5] <- c(basecmANNTrain$byClass[['F1']], basecmANNTest$byClass[['F1']],
+                       cmANNTrain$byClass[['F1']],cmANNTest$byClass[['F1']])
+svmComp[1:4,5] <- c(basecmSVMTrain$byClass[['F1']], basecmSVMTest$byClass[['F1']],
+                       cmSVMTrain$byClass[['F1']],cmSVMTest$byClass[['F1']])
+
+```
+
+# Compute Area under ROC Curve
+```{r}
+# compute the area under the ROC curve 
+
+# get AUC (first get probabilities for ROCR)
+
+# for logreg
+baselogregpred_train<- prediction(predict(base_logreg, type="response", normMixTrain[-34]), train_labels)
+baselogregpred_test<- prediction(predict(base_logreg, type="response", normMixVal[-34]), val_labels)
+logregpred_train<- prediction(predict(logreg, type="prob", normMixTrain[-34])[,2],  train_labels)
+logregpred_test<- prediction(predict(logreg, type="prob", normMixVal[-34])[,2], val_labels)
+# for tree
+basetreepred_train<- prediction(predict(base_tree, type="prob", normMixTrain[-34])[,2], train_labels)
+basetreepred_test<- prediction(predict(base_tree, type="prob", normMixVal[-34])[,2], val_labels)
+treepred_train<- prediction(predict(tree, type="prob", normMixTrain[-34])[,2], train_labels)
+treepred_test<- prediction(predict(tree, type="prob", normMixVal[-34])[,2], val_labels)
+# for ann
+baseannpred_train<- prediction(predict(base_ann, type="raw", normNumTrain[-37]), train_labels)
+baseannpred_test<- prediction(predict(base_ann, type="raw", normNumVal[-37]), val_labels)
+annpred_train<- prediction(predict(ann, type="prob", normNumTrain[-37])[,2], train_labels)
+annpred_test<- prediction(predict(ann, type="prob", normNumVal[-37])[,2], val_labels)
+# for svm
+basesvmpred_train<- prediction(predict(base_svm, type="prob", newdata=normNumTrain[-37])[,2], train_labels)
+basesvmpred_test<- prediction(predict(base_svm, type="prob", normNumVal[-37])[,2], val_labels)
+svmpred_train<- prediction(predict(svm, type="prob", normNumTrain[-37])[,2], train_labels)
+svmpred_test<- prediction(predict(svm, type="prob", normNumVal[-37])[,2], val_labels)
+
+# put AUCs in tables
+logregComp[1:4,6] <- c((performance(baselogregpred_train, measure = "auc"))@y.values[[1]], (performance(baselogregpred_test, measure = "auc"))@y.values[[1]], (performance(logregpred_train, measure = "auc"))@y.values[[1]], (performance(logregpred_test, measure = "auc"))@y.values[[1]])
+
+treeComp[1:4,6] <- c((performance(basetreepred_train, measure = "auc"))@y.values[[1]], (performance(basetreepred_test, measure = "auc"))@y.values[[1]], (performance(treepred_train, measure = "auc"))@y.values[[1]], (performance(treepred_test, measure = "auc"))@y.values[[1]]) 
+
+annComp[1:4,6] <- c((performance(baseannpred_train, measure = "auc"))@y.values[[1]],(performance(baseannpred_test, measure = "auc"))@y.values[[1]], (performance(annpred_train, measure = "auc"))@y.values[[1]], (performance(annpred_test, measure = "auc"))@y.values[[1]])
+
+svmComp[1:4,6] <- c((performance(basesvmpred_train, measure = "auc"))@y.values[[1]],(performance(basesvmpred_test, measure = "auc"))@y.values[[1]], (performance(svmpred_train, measure = "auc"))@y.values[[1]], (performance(svmpred_test, measure = "auc"))@y.values[[1]])
+
+```
+
+Since our model only has two classes, I can compute the area under the ROC curve as well as the sensitivity and the specificity under the 50% cutoff as a performance measure. I used various measures for my model, including: Accuracy, Kappa, Precision, Recall, F1 Score, and AUC. Since the original data was imbalanced (before I balanced it), and the test data is imbalanced, I favored kappa, precision, recall, F1 score, and AUC over Accuracy. Additionally, since F1 score is a robust measure, I favored that score the most. 
+
+# Compare Tuned/Cross-Validated Models vs Base Models
+```{r}
+# show tables
+
+# for log reg
+logregComp
+
+# for classification tree
+treeComp
+
+# for ANN
+annComp
+
+# for SVM
+svmComp
+```
+The optimized models went through hyperparameter optimization, k-fold cross validation, and recursive feature elimination. For logistic regression, the optimized model performed better than the base model. Although the AUCs and F1 are similar, the accuracy, kappa, and precision of the optimized model were slightly higher. For logistic regression, I decided to proceed with the optimized model.
+
+For the classification tree using the "C5.0" function, the optimized model performed much better than the base model. Although the accuracy is lower on the test data on the optimized model, the other metrics are much higher. Though the bias error is similar between the base and the optimized for this model, the variance error is much lower on the optimized model. I again proceeded with the optimized model for the classification tree. I am not sure what happened with the train data on this model, as the accuracy is 100%, as are the precicision and recall, but the AUC is 0. Although decision trees are prone to overfitting, I could not figure out why the AUC came out as 0.
+
+For the ANN model, the decision was difficult. The base model had higher performance on Precision and Accuracy on the test data, but the optimized data had higher Kappa, Recall, and F1 score. Since I weight F1 score higher than Accuracy on reliability, I proceeded with the optimized model for this one.
+
+For the SVM model, the optimized model performed better overall. The AUC, Precision, and Accuracy are higher on the test data using the optimized model in comparison to the base model. The models are quite similar in performance though, so I ended up utilizing the optimized model.
+
+# Use Better Model (base or optimized) For Comparison
+```{r}
+# create table for comparisons
+tab[1,1:6] <- logregComp[3,1:6]
+tab[2,1:6] <- logregComp[4,1:6]
+tab[3,1:6] <- treeComp[3,1:6]
+tab[4,1:6] <- treeComp[4,1:6]
+tab[5,1:6] <- annComp[3,1:6]
+tab[6,1:6] <- annComp[4,1:6]
+tab[7,1:6] <- svmComp[3,1:6]
+tab[8,1:6] <- svmComp[4,1:6]
+
+# take a look
+tab[1:8,1:6]
+
+# take a look at ROC curves
+# for logistic regression 
+logregroc_train<-performance(logregpred_train,measure = "tpr",x.measure="fpr")
+plot(logregroc_train, main = "ROC curve for Logistic Regression on Train", colorize = T)
+abline(a = 0, b = 1)
+
+logregroc_test<-performance(logregpred_test,measure = "tpr",x.measure="fpr")
+plot(logregroc_test, main = "ROC curve for Logistic Regression on Test", colorize = T)
+abline(a = 0, b = 1)
+
+# for classification tree
+treeroc_train<-performance(treepred_train,measure = "tpr",x.measure="fpr")
+plot(treeroc_train, main = "ROC curve for Decision Tree on Train", colorize = T)
+abline(a = 0, b = 1)
+
+treeroc_test<-performance(treepred_test,measure = "tpr",x.measure="fpr")
+plot(treeroc_test, main = "ROC curve for Decision Tree on Test", colorize = T)
+abline(a = 0, b = 1)
+
+# for ann 
+annroc_train<-performance(annpred_train,measure = "tpr",x.measure="fpr")
+plot(annroc_train, main = "ROC curve for ANN on Train", colorize = T)
+abline(a = 0, b = 1)
+
+annroc_test<-performance(annpred_test,measure = "tpr",x.measure="fpr")
+plot(annroc_test, main = "ROC curve for ANN on Test", colorize = T)
+abline(a = 0, b = 1)
+
+# for svm
+svmroc_train<-performance(svmpred_train,measure = "tpr",x.measure="fpr")
+plot(svmroc_train, main = "ROC curve for SVM on Train", colorize = T)
+abline(a = 0, b = 1)
+
+svmroc_test<-performance(svmpred_test,measure = "tpr",x.measure="fpr")
+plot(svmroc_test, main = "ROC curve for SVM on Test", colorize = T)
+abline(a = 0, b = 1)
+
+```
+
+Out of the four tuned and optimized models, logistic regression performed the worst. Although it had high recall, the other metrics were much lower than the other models. The base ANN model was overfit: though the bias error is low, the variance error was very high. By decreasing the number of features utilized in my model and performing k fold cross validation, I was able to get a better optimized ANN model. Since SVM, decision tree, and ANN performed okay, I used these models for my ensemble function. 
+
+## Model Tuning & Performance Improvement
+```{r}
+# Build an ensemble model
+
+# first create function to get the mode
+calc_mode <- function(x){
+  # find unique values, then count them up and find the highest one 
+  unique_val <- unique(x)
+  unique_val[which.max(tabulate(match(x, unique_val)))]
+}
+
+# create function called predictMortality, which ensembles the models and returns the 
+# mode of the predictions as well as the mean of the prediction probabilities
+predictMortality <- function(x){
+  
+  # dummy code test for ann and svm
+  x.dummy <-  x %>% 
+  mutate(Gender=as.numeric(as.factor(Gender)),
+         In.hospital_death=as.numeric(as.factor(In.hospital_death))) %>% 
+  dummy_cols(remove_selected_columns =TRUE) %>% 
+  relocate(In.hospital_death, .after = last_col())
+  
+  # change in hospital death to factor
+  x.dummy$In.hospital_death <- as.factor(x.dummy$In.hospital_death)
+  
+  # get probabilities
+  tree_prob <- predict(tree, type="prob", x)[,2]
+  ann_prob <- predict(ann, type="prob", x.dummy)[,2]
+  svm_prob <- predict(svm, type="prob", x.dummy)[,2]
+  
+  # bind them 
+  prob <- cbind(tree_prob, ann_prob, svm_prob)
+  
+  # get average probabilities
+  means <- apply(prob, 1, mean)
+  
+  # decision tree
+  tree_pred  <- predict(tree, x)
+  
+  # ann
+  ann_pred <- predict(ann, x.dummy)
+  
+  # svm
+  svm_pred <- predict(svm, x.dummy)
+
+  # combine 
+  all  <- cbind(tree_pred,ann_pred,svm_pred)
+
+  # get mode
+  modes <- apply(all, 1, calc_mode)
+  
+  return(list(modes = modes, means = means))
+}
+
+```
+
+In my ensemble function, I combined the predictions for the decision tree, ann, and svm and took the mode as the majority vote. I also extracted the probabilities and took their mean so that I could generate an ROC curve from it.
+
+# Use Ensemble Function on Train and Test Data
+```{r}
+# use ensemble function on train data
+pred_ens_train <- as.factor(predictMortality(normMixTrain)[[1]])
+# try ensemble function on test data
+pred_ens_test <- as.factor(predictMortality(normMixVal)[[1]])
+```
+
+# Get Model Parameters
+```{r}
+# first change levels
+levels(pred_ens_train) <- c("Survived", "Deceased")
+levels(pred_ens_test) <- c("Survived", "Deceased")
+
+# get confusion matrices
+cmensTrain <- confusionMatrix(as.factor(pred_ens_train), as.factor(train_labels), mode = "prec_recall",
+                              positive="Deceased")
+cmensTest <- confusionMatrix(as.factor(pred_ens_test), as.factor(val_labels), mode = "prec_recall",
+                              positive="Deceased")
+
+# get accuracies
+tab[9:10, 1] <- c(cmensTrain$overall[['Accuracy']],cmensTest$overall[['Accuracy']])
+
+# get kappa
+tab[9:10, 2] <- c(cmensTrain$overall[['Kappa']],cmensTest$overall[['Kappa']])
+
+# get precision and recall
+tab[9:10, 3] <- c(cmensTrain$byClass[['Precision']],cmensTest$byClass[['Precision']])
+tab[9:10, 4] <- c(cmensTrain$byClass[['Recall']],cmensTest$byClass[['Recall']])
+
+# get F1 score
+tab[9:10, 5] <- c(cmensTrain$byClass[['F1']],cmensTest$byClass[['F1']])
+
+# get probabilities for AUC
+ensprobTrain <- prediction((predictMortality(normMixTrain)[[2]]), train_labels)
+ensprobTest <- prediction(predictMortality(normMixVal)[[2]], val_labels)
+
+# get AUCs 
+tab[9:10,6] <- c((performance(ensprobTrain, measure = "auc"))@y.values[[1]], (performance(ensprobTest , measure = "auc"))@y.values[[1]])
+
+# look at final table
+tab
+
+# take a look at ROC plots
+ensroc_train <- performance(ensprobTrain,measure = "tpr",x.measure="fpr")
+plot(ensroc_train, main = "ROC curve for Ensemble Model on Train", colorize = T)
+abline(a = 0, b = 1)
+
+ensroc_test <- performance(ensprobTest ,measure = "tpr",x.measure="fpr")
+plot(ensroc_test, main = "ROC curve for Ensemble Model on Test", colorize = T)
+abline(a = 0, b = 1)
+
+```
+
+Compared to the other models, the ensemble model performed better. It had high accuracy
+and higher AUC in comparison to the other models on the test data. The bias error for the ensemble model was lower than the other models, while the variance error was also lower. Bias terror indicates error on the training data set, while variance error indicates error on the test data, or overfitting. However, overall the precision and the recall of the models are low on the test set, so I should probably tune my models more in order to get an optimal model. Overall, though I tried to reduce overfitting as much as possible,  most of the models performed much better on the train data than the test data. I could increase the amount of k-fold cross validation and repeat it more times to see if I could get a better result.  
+
+At its current state, I would not recommend the use of this model. The false positive and false negative rates are still high, and that could lead to incorrect decisions that could impact the life of a patient. Additionally, the parameters that I added: sepsis, cardiac, and kidney, were overall not considered very useful for any of the models. In general, more tuning of the models are necessary to make this usable in the business setting. 
